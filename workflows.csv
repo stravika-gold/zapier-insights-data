@@ -1,0 +1,8 @@
+workflow_id,workflow_name,owner_team,environment,status,created_at,updated_at,trigger_app,trigger_type,step_count,complexity_tier,expected_runs_per_day,sla_criticality,data_sensitivity
+wf_support_router,Support Ticket Router,Support,prod,on,2025-06-15T10:00:00Z,2026-01-20T14:30:00Z,Zendesk,new_ticket,5,medium,120,high,pii
+wf_lead_sync,Lead Sync: HubSpot → Salesforce,RevOps,prod,on,2025-03-10T09:00:00Z,2026-02-10T10:00:00Z,HubSpot,new_contact,4,medium,80,high,pii
+wf_shopify_orders,Shopify Order Processor,Ecommerce,prod,on,2025-01-20T11:00:00Z,2026-01-15T08:00:00Z,Shopify,order_created,7,high,250,high,pci
+wf_shopify_returns,Shopify Return Handler,Ecommerce,prod,on,2025-04-01T13:00:00Z,2026-01-10T09:00:00Z,Shopify,refund_created,4,medium,40,medium,pci
+wf_slack_digest,Daily Slack Digest,Internal,prod,on,2025-08-01T07:00:00Z,2025-12-01T10:00:00Z,Schedule,daily,3,low,1,low,none
+wf_sheet_backup,Sheet Backup,Internal,prod,on,2025-09-15T08:00:00Z,2025-11-20T12:00:00Z,Google Sheets,row_updated,2,low,4,low,none
+wf_invoice_sync,Invoice Sync: Stripe → QuickBooks,Finance,prod,on,2025-05-20T14:00:00Z,2026-01-25T16:00:00Z,Stripe,invoice_paid,3,low,30,medium,pci

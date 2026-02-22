@@ -1,0 +1,10 @@
+provider,started_at,ended_at,status,impact,summary
+Shopify,2026-02-01T00:00:00Z,2026-02-14T13:59:00Z,operational,minor,Normal operations outside of Feb 14 incident.
+Salesforce,2026-02-01T00:00:00Z,2026-02-16T23:59:00Z,operational,minor,Normal operations.
+HubSpot,2026-02-01T00:00:00Z,2026-02-16T23:59:00Z,operational,minor,Normal operations.
+Stripe,2026-02-01T00:00:00Z,2026-02-16T23:59:00Z,operational,minor,Normal operations.
+Salesforce,2026-02-03T06:00:00Z,2026-02-03T06:45:00Z,degraded,minor,Brief login latency spike. Resolved.
+Zendesk,2026-02-07T11:00:00Z,2026-02-07T11:15:00Z,degraded,minor,Brief API timeout spike. Auto-resolved.
+Slack,2026-02-08T15:00:00Z,2026-02-08T15:20:00Z,degraded,minor,Message delivery delays in some regions.
+Google Sheets,2026-02-12T09:00:00Z,2026-02-12T09:30:00Z,degraded,minor,Elevated read latency for Sheets API.
+Shopify,2026-02-14T14:00:00Z,2026-02-14T17:30:00Z,degraded,major,Elevated API latency and intermittent 503 errors affecting order and refund endpoints.
