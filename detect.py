@@ -377,14 +377,16 @@ def calculate_health_score(workflow, runs, detections, external_status=None):
         score -= 10
         deductions.append(latency_deduction)
 
-    # --- 3. Silent volume drop (-25) ---
+    # --- 3. Silent volume drop (-35) ---
+    # Weighted heavily: silent degradation is the most dangerous signal
+    # because there's no error to alert on -- workflows just stop working.
     silent_detections = [d for d in detections if d["type"] == "silent_failure"]
     if silent_detections:
-        score -= 25
+        score -= 35
         d = silent_detections[0]
         deductions.append({
             "signal": "silent_failure",
-            "points": -25,
+            "points": -35,
             "detail": d["detail"],
             "metrics": d.get("metrics", {}),
         })
@@ -707,7 +709,7 @@ def _band_counts(insights):
     return ", ".join(parts)
 
 
-def format_all_insights(insights_output):
+def format_all_insights(insights_output, total_workflows=None):
     """
     Format the full insights output for Slack.
 
@@ -716,7 +718,11 @@ def format_all_insights(insights_output):
     """
     count = insights_output.get("insights_count", 0)
     if count == 0:
-        return ":white_check_mark: All workflows healthy. No insights to report."
+        monitored = f"{total_workflows} workflows monitored. " if total_workflows else ""
+        return (
+            f":white_check_mark: *Zapier Insights \u2014 All Workflows Healthy*\n"
+            f"{monitored}No material changes in the last 24 hours."
+        )
 
     insights = insights_output.get("insights", [])
     wf_word = "Workflow" if count == 1 else "Workflows"
@@ -743,24 +749,50 @@ def format_all_insights(insights_output):
 
 
 def build_suggested_action(detections):
-    """Generate a suggested action based on detected signals."""
+    """Generate an evidence-specific suggested action based on detected signals."""
     types = [d["type"] for d in detections]
 
     if "audit_correlation" in types:
         for d in detections:
             if d["type"] == "audit_correlation":
-                steps = d.get("metrics", {}).get("failed_steps", [])
-                if steps:
-                    return f"Re-authenticate the connection used by step {', '.join(steps)}."
+                m = d.get("metrics", {})
+                steps = m.get("failed_steps", [])
+                count = m.get("auth_failure_count", 0)
+                window = m.get("failure_window_minutes", 0)
+                step_str = f" step {', '.join(steps)}" if steps else ""
+                detail = ""
+                if count and window:
+                    detail = f" {count} failures within {window:.0f}min of credential change."
+                return f"Re-authenticate the connection used by{step_str}.{detail}"
         return "Re-authenticate the affected connection."
 
     if "silent_failure" in types:
+        for d in detections:
+            if d["type"] == "silent_failure":
+                m = d.get("metrics", {})
+                ref = m.get("reference_volume_per_day")
+                recent = m.get("recent_volume_per_day")
+                if ref and recent:
+                    return (
+                        f"Check Zap trigger configuration and upstream event source. "
+                        f"Volume dropped from ~{ref:.0f}/day to ~{recent:.0f}/day."
+                    )
         return "Check Zap trigger configuration and upstream event source."
 
     if "provider_anomaly" in types:
         for d in detections:
             if d["type"] == "provider_anomaly":
-                provider = d.get("metrics", {}).get("provider", "the provider")
+                m = d.get("metrics", {})
+                provider = m.get("provider", "the provider")
+                start = m.get("degradation_start", "")
+                end = m.get("degradation_end", "")
+                if start and end:
+                    s = start[11:16]
+                    e = end[11:16]
+                    return (
+                        f"Check {provider} status (degraded {s}\u2013{e}). "
+                        f"If stable now, add retry logic or temporary alerting."
+                    )
                 return f"Check {provider} status page. Consider adding retry logic or alerting."
         return "Check provider status page and consider retry logic."
 
@@ -849,7 +881,7 @@ if data:
     )
 
     # Format for Slack
-    slack_message = format_all_insights(result)
+    slack_message = format_all_insights(result, total_workflows=len(data["workflows"]))
 
     # Set output for next Zapier step
     output = {
