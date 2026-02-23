@@ -14,9 +14,10 @@ No LLM. No ML. Deterministic detection only.
 import csv
 import io
 import json
+import re
 import requests
 from datetime import datetime, timedelta
-from collections import defaultdict
+from collections import Counter, defaultdict
 from statistics import median
 
 
@@ -486,29 +487,130 @@ STATUS_LABELS = {
     "healthy": "Healthy",
 }
 
+# Why-this-matters interpretation by signal type
+SIGNAL_INTERPRETATION = {
+    "silent_failure": (
+        "Likely trigger break or upstream event suppression "
+        "(no error signal \u2014 silent degradation)"
+    ),
+    "audit_correlation": (
+        "High probability the credential update caused the failure spike"
+    ),
+    "external_incident": (
+        "Cross-workflow impact suggests upstream provider issue"
+    ),
+    "fail_rate": (
+        "Elevated failure rate may indicate configuration or connectivity issue"
+    ),
+    "latency_spike": (
+        "Performance degradation may impact downstream processes"
+    ),
+}
+
+# Macro summary category labels
+SIGNAL_CATEGORY = {
+    "silent_failure": "potential silent degradation",
+    "audit_correlation": "credential-related failure",
+    "external_incident": "provider anomaly",
+    "fail_rate": "elevated failure rate",
+    "latency_spike": "latency spike",
+}
+
+
+def _clean_detail(detail, signal):
+    """Extract clean observation lines from a deduction detail string."""
+    if signal == "silent_failure":
+        lines = []
+        vol = re.match(r'Volume dropped from (~[\d]+/day) to (~[\d]+/day)', detail)
+        rate = re.search(r'success rate ([\d.]+%)', detail)
+        if vol:
+            lines.append(f"Volume dropped from {vol.group(1)} to {vol.group(2)}")
+        if rate:
+            lines.append(f"Success rate remains {rate.group(1)}")
+        return lines or [detail.split(".")[0]]
+
+    if signal == "fail_rate":
+        match = re.match(r'Failure rate ([\d.]+%) \((\d+/\d+) runs', detail)
+        if match:
+            return [f"Failure rate increased to {match.group(1)} ({match.group(2)} runs)"]
+        return [detail.split("exceeds")[0].strip()]
+
+    if signal == "audit_correlation":
+        return [detail.rstrip(".")]
+
+    if signal == "external_incident":
+        lines = []
+        ratio = re.search(r'([\d.]+)x latency increase', detail)
+        provider = re.search(r'using (\w+)', detail)
+        timeouts = re.search(r'(\d+) timeout failure', detail)
+        if ratio:
+            prov = provider.group(1) if provider else "provider"
+            lines.append(f"{ratio.group(1)}x latency increase during {prov} degradation window")
+        if timeouts:
+            lines.append(f"{timeouts.group(1)} timeout failures")
+        return lines or [detail.rstrip(".")]
+
+    if signal == "latency_spike":
+        return [detail.rstrip(".")]
+
+    return [detail.rstrip(".")]
+
 
 def format_insight_card(insight):
-    """Format a single insight as a Slack message."""
+    """Format a single insight as an executive-style Slack card."""
     emoji = STATUS_EMOJI.get(insight["status"], ":question:")
     label = STATUS_LABELS.get(insight["status"], insight["status"])
     score = insight["health_score"]
     name = insight["workflow_name"]
 
     lines = [
-        f"{emoji} *Workflow: {name}*",
-        f"Health Score: *{score}* ({label})",
+        f"{emoji} *{name}*",
+        f"Health Score: {score} \u2014 {label}",
         "",
-        "*Detected:*",
+        "*What changed*",
     ]
 
     for d in insight.get("deductions", []):
-        lines.append(f"  - {d['detail']} ({d['signal']}: {d['points']})")
+        for obs in _clean_detail(d["detail"], d.get("signal", "")):
+            lines.append(obs)
+
+    # Why this matters
+    seen = set()
+    interpretations = []
+    for d in insight.get("deductions", []):
+        s = d.get("signal", "")
+        if s in SIGNAL_INTERPRETATION and s not in seen:
+            interpretations.append(SIGNAL_INTERPRETATION[s])
+            seen.add(s)
+
+    if interpretations:
+        lines.append("")
+        lines.append("*Why this matters*")
+        for interp in interpretations:
+            lines.append(interp)
 
     if insight.get("suggested_action"):
         lines.append("")
-        lines.append(f"*Suggested action:* {insight['suggested_action']}")
+        lines.append("*Suggested action*")
+        lines.append(insight["suggested_action"])
 
     return "\n".join(lines)
+
+
+def _macro_summary(insights):
+    """Build one-line macro summary from insight signals."""
+    signal_counts = Counter()
+    for insight in insights:
+        for d in insight.get("deductions", []):
+            signal = d.get("signal", "")
+            if signal in SIGNAL_CATEGORY:
+                signal_counts[signal] += 1
+    if not signal_counts:
+        return ""
+    parts = []
+    for signal, count in signal_counts.items():
+        parts.append(f"{count} {SIGNAL_CATEGORY[signal]}")
+    return " \u00b7 ".join(parts)
 
 
 def format_all_insights(insights_output):
@@ -517,17 +619,24 @@ def format_all_insights(insights_output):
     if count == 0:
         return ":white_check_mark: All workflows healthy. No insights to report."
 
-    cards = []
-    for insight in insights_output.get("insights", []):
-        cards.append(format_insight_card(insight))
-
+    insights = insights_output.get("insights", [])
+    wf_word = "Workflow" if count == 1 else "Workflows"
+    need_word = "Needs" if count == 1 else "Need"
     header = (
-        f":bar_chart: *Zapier Insights Report* "
-        f"({count} workflow{'s' if count != 1 else ''} flagged)\n"
+        f":rotating_light: *Zapier Insights \u2014 "
+        f"{count} {wf_word} {need_word} Attention*"
     )
-    separator = "\n---\n"
 
-    return header + separator.join(cards)
+    summary = _macro_summary(insights)
+    cards = [format_insight_card(i) for i in insights]
+
+    parts = [header]
+    if summary:
+        parts.append(f"_{summary}_")
+    parts.append("")
+    parts.append("\n\n---\n\n".join(cards))
+
+    return "\n".join(parts)
 
 
 def build_suggested_action(detections):
