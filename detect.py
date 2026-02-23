@@ -358,7 +358,7 @@ def calculate_health_score(workflow, runs, detections, external_status=None):
             fail_rate = failed / total
 
             if fail_rate > 0.02:
-                penalty = min(50, int((fail_rate - 0.02) / 0.48 * 50))
+                penalty = min(50, max(5, int((fail_rate - 0.02) / 0.48 * 50)))
                 if penalty > 0:
                     score -= penalty
                     deductions.append({
@@ -381,30 +381,36 @@ def calculate_health_score(workflow, runs, detections, external_status=None):
     silent_detections = [d for d in detections if d["type"] == "silent_failure"]
     if silent_detections:
         score -= 25
+        d = silent_detections[0]
         deductions.append({
             "signal": "silent_failure",
             "points": -25,
-            "detail": silent_detections[0]["detail"],
+            "detail": d["detail"],
+            "metrics": d.get("metrics", {}),
         })
 
     # --- 4. Audit-correlated failure spike (-15) ---
     audit_detections = [d for d in detections if d["type"] == "audit_correlation"]
     if audit_detections:
         score -= 15
+        d = audit_detections[0]
         deductions.append({
             "signal": "audit_correlation",
             "points": -15,
-            "detail": audit_detections[0]["detail"],
+            "detail": d["detail"],
+            "metrics": d.get("metrics", {}),
         })
 
     # --- 5. External incident overlap (-15) ---
     provider_detections = [d for d in detections if d["type"] == "provider_anomaly"]
     if provider_detections:
         score -= 15
+        d = provider_detections[0]
         deductions.append({
             "signal": "external_incident",
             "points": -15,
-            "detail": provider_detections[0]["detail"],
+            "detail": d["detail"],
+            "metrics": d.get("metrics", {}),
         })
 
     score = max(0, min(100, score))
@@ -509,12 +515,14 @@ SIGNAL_INTERPRETATION = {
 
 # Macro summary category labels
 SIGNAL_CATEGORY = {
-    "silent_failure": "potential silent degradation",
+    "silent_failure": "silent degradation",
     "audit_correlation": "credential-related failure",
     "external_incident": "provider anomaly",
     "fail_rate": "elevated failure rate",
     "latency_spike": "latency spike",
 }
+
+MAX_SIGNALS_PER_CARD = 2
 
 
 def _clean_detail(detail, signal):
@@ -532,7 +540,7 @@ def _clean_detail(detail, signal):
     if signal == "fail_rate":
         match = re.match(r'Failure rate ([\d.]+%) \((\d+/\d+) runs', detail)
         if match:
-            return [f"Failure rate increased to {match.group(1)} ({match.group(2)} runs)"]
+            return [f"Failure rate {match.group(1)} ({match.group(2)} runs)"]
         return [detail.split("exceeds")[0].strip()]
 
     if signal == "audit_correlation":
@@ -556,12 +564,71 @@ def _clean_detail(detail, signal):
     return [detail.rstrip(".")]
 
 
+def _format_evidence(deduction):
+    """Format evidence line from deduction metrics."""
+    signal = deduction.get("signal", "")
+    metrics = deduction.get("metrics", {})
+    if not metrics:
+        return None
+
+    if signal == "silent_failure":
+        ref_vol = metrics.get("reference_volume_per_day")
+        recent_vol = metrics.get("recent_volume_per_day")
+        if ref_vol and recent_vol:
+            return f"Baseline ~{ref_vol:.0f}/day vs current ~{recent_vol:.0f}/day (last 48h vs 7-day avg)"
+
+    if signal == "audit_correlation":
+        ts = metrics.get("audit_timestamp", "")
+        count = metrics.get("auth_failure_count", 0)
+        window = metrics.get("failure_window_minutes", 0)
+        if ts and count:
+            ts_short = ts[:16].replace("T", " ")
+            return f"{count} failures within {window:.0f}min of credential change at {ts_short}"
+
+    if signal == "external_incident":
+        affected = metrics.get("affected_workflows", [])
+        provider = metrics.get("provider", "")
+        start = metrics.get("degradation_start", "")
+        end = metrics.get("degradation_end", "")
+        total_timeouts = metrics.get("total_timeouts", 0)
+        if start and end:
+            s = start[11:16]
+            e = end[11:16]
+            parts = [f"{provider} degradation {s}-{e}"]
+            if total_timeouts:
+                parts.append(f"{total_timeouts} timeouts")
+            return " | ".join(parts)
+
+    if signal == "fail_rate":
+        return None  # Detail string already contains the evidence
+
+    if signal == "latency_spike":
+        return None  # Detail string already contains the evidence
+
+    return None
+
+
 def format_insight_card(insight):
-    """Format a single insight as an executive-style Slack card."""
+    """
+    Format a single insight as an executive-style Slack card.
+
+    Sections: What changed (observation), Why this matters (interpretation),
+    Evidence (metrics), Suggested action.
+    Limits to top MAX_SIGNALS_PER_CARD deductions by severity.
+    """
     emoji = STATUS_EMOJI.get(insight["status"], ":question:")
     label = STATUS_LABELS.get(insight["status"], insight["status"])
     score = insight["health_score"]
     name = insight["workflow_name"]
+
+    # Sort deductions by severity (most impactful first), limit to top N
+    deductions = sorted(
+        insight.get("deductions", []),
+        key=lambda d: abs(d.get("points", 0)),
+        reverse=True,
+    )
+    extra_count = max(0, len(deductions) - MAX_SIGNALS_PER_CARD)
+    deductions = deductions[:MAX_SIGNALS_PER_CARD]
 
     lines = [
         f"{emoji} *{name}*",
@@ -570,14 +637,17 @@ def format_insight_card(insight):
         "*What changed*",
     ]
 
-    for d in insight.get("deductions", []):
+    for d in deductions:
         for obs in _clean_detail(d["detail"], d.get("signal", "")):
-            lines.append(obs)
+            lines.append(f"\u2022 {obs}")
+
+    if extra_count > 0:
+        lines.append(f"_+{extra_count} more signal{'s' if extra_count > 1 else ''}_")
 
     # Why this matters
     seen = set()
     interpretations = []
-    for d in insight.get("deductions", []):
+    for d in deductions:
         s = d.get("signal", "")
         if s in SIGNAL_INTERPRETATION and s not in seen:
             interpretations.append(SIGNAL_INTERPRETATION[s])
@@ -588,6 +658,19 @@ def format_insight_card(insight):
         lines.append("*Why this matters*")
         for interp in interpretations:
             lines.append(interp)
+
+    # Evidence
+    evidence_lines = []
+    for d in deductions:
+        ev = _format_evidence(d)
+        if ev:
+            evidence_lines.append(ev)
+
+    if evidence_lines:
+        lines.append("")
+        lines.append("*Evidence*")
+        for ev in evidence_lines:
+            lines.append(f"_{ev}_")
 
     if insight.get("suggested_action"):
         lines.append("")
@@ -613,8 +696,24 @@ def _macro_summary(insights):
     return " \u00b7 ".join(parts)
 
 
+def _band_counts(insights):
+    """Build band count string like '1 At Risk, 2 Watch'."""
+    counts = Counter(i.get("status", "") for i in insights)
+    parts = []
+    if counts.get("at_risk", 0) > 0:
+        parts.append(f"{counts['at_risk']} At Risk")
+    if counts.get("watch", 0) > 0:
+        parts.append(f"{counts['watch']} Watch")
+    return ", ".join(parts)
+
+
 def format_all_insights(insights_output):
-    """Format the full insights output for Slack."""
+    """
+    Format the full insights output for Slack.
+
+    Executive header with band counts and macro summary, then per-workflow cards
+    with What changed / Why this matters / Evidence / Suggested action sections.
+    """
     count = insights_output.get("insights_count", 0)
     if count == 0:
         return ":white_check_mark: All workflows healthy. No insights to report."
@@ -622,6 +721,8 @@ def format_all_insights(insights_output):
     insights = insights_output.get("insights", [])
     wf_word = "Workflow" if count == 1 else "Workflows"
     need_word = "Needs" if count == 1 else "Need"
+
+    bands = _band_counts(insights)
     header = (
         f":rotating_light: *Zapier Insights \u2014 "
         f"{count} {wf_word} {need_word} Attention*"
@@ -631,6 +732,8 @@ def format_all_insights(insights_output):
     cards = [format_insight_card(i) for i in insights]
 
     parts = [header]
+    if bands:
+        parts.append(bands)
     if summary:
         parts.append(f"_{summary}_")
     parts.append("")
