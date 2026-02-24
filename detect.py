@@ -23,6 +23,7 @@ from statistics import median
 # --- Window constants ---
 BASELINE_WINDOW_DAYS = 7       # trailing, excluding recent window
 RECENT_WINDOW_HOURS = 48       # current observation period
+BUCKET_HOURS = 6               # rolling bucket size for degradation onset
 
 
 # =============================================================================
@@ -139,6 +140,57 @@ def _parse_ts(ts_str):
 # DETECTION ENGINE
 # =============================================================================
 
+def _estimate_degradation_onset(runs, window_start, window_end, baseline_daily_rate):
+    """Estimate when volume degradation began using rolling 6h bucket analysis.
+
+    Walks 6h buckets from window_start to window_end. Returns the start of the
+    first bucket where run count drops below 50% of the baseline 6h average AND
+    stays below that threshold for at least 12 consecutive hours (2 buckets).
+
+    Returns datetime or None if no clear onset found.
+    """
+    if not runs or baseline_daily_rate <= 0:
+        return None
+
+    baseline_bucket_avg = baseline_daily_rate * BUCKET_HOURS / 24
+    threshold = baseline_bucket_avg * 0.5
+
+    # Build sorted timestamps for all runs in the full window
+    all_ts = sorted(
+        _parse_ts(r["started_at"]) for r in runs
+        if window_start <= _parse_ts(r["started_at"]) <= window_end
+    )
+
+    if not all_ts:
+        return None
+
+    # Walk buckets
+    bucket_start = window_start
+    consecutive_low_start = None
+    consecutive_low_hours = 0
+
+    while bucket_start < window_end:
+        bucket_end = bucket_start + timedelta(hours=BUCKET_HOURS)
+        count = sum(1 for ts in all_ts if bucket_start <= ts < bucket_end)
+
+        if count < threshold:
+            if consecutive_low_start is None:
+                consecutive_low_start = bucket_start
+                consecutive_low_hours = BUCKET_HOURS
+            else:
+                consecutive_low_hours += BUCKET_HOURS
+
+            if consecutive_low_hours >= 12:
+                return consecutive_low_start
+        else:
+            consecutive_low_start = None
+            consecutive_low_hours = 0
+
+        bucket_start = bucket_end
+
+    return consecutive_low_start
+
+
 def detect_silent_failure(workflow, runs, analysis_end=None):
     """
     Detect silent failure: volume drops >40% while success rate stays >95%.
@@ -196,6 +248,24 @@ def detect_silent_failure(workflow, runs, analysis_end=None):
         baseline_label = f"{baseline_start.strftime('%b %d')}-{window_start.strftime('%b %d')}"
         current_label = f"{window_start.strftime('%b %d')}-{analysis_end.strftime('%b %d')}"
 
+        # --- Timestamp: last processed run (fact) ---
+        recent_timestamps = [_parse_ts(r["started_at"]) for r in recent_runs]
+        last_processed_run = max(recent_timestamps) if recent_timestamps else None
+        last_processed_str = (
+            last_processed_run.strftime("%Y-%m-%d %H:%M")
+            if last_processed_run else "unknown"
+        )
+
+        # --- Timestamp: degradation began (inference) ---
+        # Rolling 6h bucket analysis over all runs in baseline+recent window
+        degradation_began = _estimate_degradation_onset(
+            runs, baseline_start, analysis_end, baseline_volume_per_day
+        )
+        degradation_began_str = (
+            f"~{degradation_began.strftime('%Y-%m-%d %H:%M')}"
+            if degradation_began else None
+        )
+
         audit = _build_audit(
             workflow_id=workflow["workflow_id"],
             detection_type="silent_failure",
@@ -228,6 +298,8 @@ def detect_silent_failure(workflow, runs, analysis_end=None):
                 "impact_label": "events/day not processed",
                 "baseline_window": baseline_label,
                 "current_window": current_label,
+                "last_processed_run": last_processed_str,
+                "degradation_began": degradation_began_str,
             },
             "audit": audit,
         }]
@@ -638,8 +710,8 @@ STATUS_EMOJI = {
 }
 
 STATUS_LABELS = {
-    "at_risk": "At Risk",
-    "watch": "Watch",
+    "at_risk": "AT RISK",
+    "watch": "WATCH",
     "healthy": "Healthy",
 }
 
@@ -960,11 +1032,11 @@ def build_suggested_action(detections):
 
 # Compact action labels for ambient cards
 COMPACT_ACTIONS = {
-    "silent_failure": "Check trigger source",
-    "audit_correlation": "Re-authenticate connection",
-    "external_incident": "Check provider status",
-    "fail_rate": "Review error logs",
-    "latency_spike": "Check performance",
+    "silent_failure": "verify trigger is still receiving events + upstream source is firing",
+    "audit_correlation": "re-authenticate the affected connection and run a test with a sample record",
+    "external_incident": "check provider status page; if resolved, consider retry logic with exponential backoff",
+    "fail_rate": "review error logs and recent configuration changes",
+    "latency_spike": "check provider performance and consider adding timeout handling",
 }
 
 
@@ -987,30 +1059,36 @@ def _compact_observation(insight):
         recent = metrics.get("recent_volume_per_day")
         rate = metrics.get("recent_success_rate")
         impact = metrics.get("estimated_daily_impact")
+        cur_window = metrics.get("current_window", "48h")
         if ref and recent:
             pct = int(round((1 - recent / ref) * 100))
-            parts = [f"Volume down {pct}% in 48h ({ref:.0f} \u2192 {recent:.0f}/day)"]
+            obs = f"Volume -{pct}% (baseline {ref:.0f}/day \u2192 {recent:.0f}/day last {cur_window})."
             if rate and rate > 0.95:
-                parts.append("No failures detected")
+                obs += f" Success {rate * 100:.0f}% \u2014 silent degradation."
+            impact_line = ""
             if impact and impact > 0:
-                parts.append(f"~{impact:.0f} events/day not processed")
-            return ". ".join(parts) + "."
+                impact_line = f"\nEst. impact: ~{impact:.0f} events/day not processed."
+            return obs + impact_line
         return "Significant volume drop with no error signal."
 
     if signal == "audit_correlation":
         count = metrics.get("auth_failure_count", 0)
+        confidence = top.get("confidence", "")
+        conf_str = f" ({confidence})" if confidence else ""
         if count:
-            return f"{count} AUTH_EXPIRED failures after credential rotation."
-        return "Auth failures correlated with credential change."
+            return f"AUTH_EXPIRED correlated with credential rotation{conf_str}. {count} failures detected."
+        return f"Auth failures correlated with credential change{conf_str}."
 
     if signal == "external_incident":
         ratio = metrics.get("avg_latency_ratio")
         provider = metrics.get("provider", "provider")
+        confidence = top.get("confidence", "")
+        conf_str = f" ({confidence})" if confidence else ""
         # Use per-workflow timeouts for the ambient card (not aggregate)
         timeouts = metrics.get("primary_workflow_timeouts", metrics.get("total_timeouts", 0))
         parts = []
         if ratio:
-            parts.append(f"{ratio:.1f}x latency during {provider} degradation")
+            parts.append(f"Latency spike aligns with {provider} degraded window{conf_str}")
         if timeouts:
             parts.append(f"{timeouts} timeouts")
         return ". ".join(parts) + "." if parts else "Provider incident detected."
@@ -1062,13 +1140,13 @@ def format_ambient_card(worst_insight, watch_count=0, total_workflows=None):
     lines = [
         f"{emoji} *{name}* \u2014 {label} ({score})",
         observation,
-        f"\u2192 {action}",
+        f"Next: {action}.",
     ]
 
-    footer_parts = ["Details in thread"]
+    footer_parts = ["React :eyes: for drilldown"]
     if watch_count > 0:
         wf_word = "workflow" if watch_count == 1 else "workflows"
-        footer_parts.append(f"{watch_count} more {wf_word} on Watch")
+        footer_parts.append(f"{watch_count} {wf_word} on Watch")
     lines.append(f"_{'. '.join(footer_parts)}._")
 
     return "\n".join(lines)
@@ -1092,14 +1170,20 @@ def _detail_metrics(insight):
             impact = metrics.get("estimated_daily_impact")
             bl_window = metrics.get("baseline_window", "7-day")
             cur_window = metrics.get("current_window", "48h")
+            last_run = metrics.get("last_processed_run")
+            deg_began = metrics.get("degradation_began")
             if ref:
                 lines.append(f"Baseline: ~{ref:.0f}/day ({bl_window})")
             if recent:
                 lines.append(f"Current: ~{recent:.0f}/day ({cur_window})")
             if rate is not None:
                 lines.append(f"Success rate: {rate * 100:.0f}%")
+            if last_run:
+                lines.append(f"Last processed run: {last_run}")
+            if deg_began:
+                lines.append(f"Degradation began: {deg_began} (inferred from volume drop vs baseline)")
             if impact and impact > 0:
-                lines.append(f"Estimated impact: ~{impact:.0f} events/day not processed")
+                lines.append(f"Est. impact: ~{impact:.0f} events/day not processed")
 
         elif signal == "audit_correlation":
             ts = metrics.get("audit_timestamp", "")
@@ -1163,13 +1247,18 @@ def _watch_summary_line(insight):
 
     if signal == "audit_correlation":
         count = metrics.get("auth_failure_count", 0)
-        return f"\u2022 {name} ({score}) \u2014 {count} AUTH_EXPIRED after credential rotation"
+        confidence = d.get("confidence", "")
+        conf_str = f" ({confidence})" if confidence else ""
+        return f"\u2022 {name} ({score}) \u2014 AUTH_EXPIRED correlated with credential rotation{conf_str}"
 
     if signal == "external_incident":
         ratio = metrics.get("avg_latency_ratio")
         provider = metrics.get("provider", "provider")
+        confidence = d.get("confidence", "")
+        conf_str = f" ({confidence})" if confidence else ""
         if ratio:
-            return f"\u2022 {name} ({score}) \u2014 {ratio:.1f}x latency during {provider} degradation"
+            return f"\u2022 {name} ({score}) \u2014 latency spike aligns with {provider} degraded window{conf_str}"
+        return f"\u2022 {name} ({score}) \u2014 {provider} degradation impact{conf_str}"
 
     if signal == "fail_rate":
         detail = d.get("detail", "")
