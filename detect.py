@@ -20,6 +20,10 @@ from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 from statistics import median
 
+# --- Window constants ---
+BASELINE_WINDOW_DAYS = 7       # trailing, excluding recent window
+RECENT_WINDOW_HOURS = 48       # current observation period
+
 
 # =============================================================================
 # DATA LOADING
@@ -73,6 +77,55 @@ def parse_input_json(input_data):
 # TIMESTAMP PARSING
 # =============================================================================
 
+def _compute_confidence(detection_type, metrics):
+    """Compute confidence level (High/Medium/Low) for a detection."""
+    if detection_type == "silent_failure":
+        drop = 1 - metrics.get("volume_ratio", 1)
+        rate = metrics.get("recent_success_rate", 0)
+        count = metrics.get("recent_runs_count", 0)
+        if drop > 0.7 and rate > 0.95 and count >= 10:
+            return "High"
+        if drop > 0.4 and rate > 0.90:
+            return "Medium"
+        return "Low"
+    if detection_type == "audit_correlation":
+        count = metrics.get("auth_failure_count", 0)
+        time_to_first = metrics.get("time_to_first_min", 999)
+        if count >= 10 and time_to_first < 60:
+            return "High"
+        if count >= 5:
+            return "Medium"
+        return "Low"
+    if detection_type == "provider_anomaly":
+        ratio = metrics.get("avg_latency_ratio", 1)
+        affected = metrics.get("affected_count", 0)
+        timeouts = metrics.get("total_timeouts", 0)
+        if ratio >= 3.0 and affected >= 2 and timeouts >= 3:
+            return "High"
+        if ratio >= 2.0 and affected >= 2:
+            return "Medium"
+        return "Low"
+    return "Low"
+
+
+def _build_audit(workflow_id, detection_type, baseline_window, current_window,
+                 baseline_rate, current_rate, delta_pct, total_runs,
+                 failed_runs, failure_rate):
+    """Build audit record for debugging and calibration."""
+    return {
+        "workflow_id": workflow_id,
+        "detection_type": detection_type,
+        "baseline_window": baseline_window,
+        "current_window": current_window,
+        "baseline_rate": baseline_rate,
+        "current_rate": current_rate,
+        "delta_pct": delta_pct,
+        "total_runs": total_runs,
+        "failed_runs": failed_runs,
+        "failure_rate": failure_rate,
+    }
+
+
 def _parse_ts(ts_str):
     """Parse ISO timestamp string to datetime."""
     ts_str = ts_str.rstrip("Z")
@@ -98,21 +151,23 @@ def detect_silent_failure(workflow, runs, analysis_end=None):
     if analysis_end is None:
         timestamps = [_parse_ts(r["started_at"]) for r in runs]
         analysis_end = max(timestamps)
+        # Snap to end of day for clean window boundaries
+        analysis_end = analysis_end.replace(hour=23, minute=59, second=59, microsecond=0)
 
-    window_48h_start = analysis_end - timedelta(hours=48)
-    baseline_start = analysis_end - timedelta(days=7)
+    window_start = analysis_end - timedelta(hours=RECENT_WINDOW_HOURS)
+    baseline_start = analysis_end - timedelta(days=BASELINE_WINDOW_DAYS)
 
-    recent_runs = [r for r in runs if _parse_ts(r["started_at"]) >= window_48h_start]
+    recent_runs = [r for r in runs if _parse_ts(r["started_at"]) >= window_start]
     baseline_runs = [
         r for r in runs
-        if baseline_start <= _parse_ts(r["started_at"]) < window_48h_start
+        if baseline_start <= _parse_ts(r["started_at"]) < window_start
     ]
 
     if not baseline_runs:
         return []
 
-    recent_days = 2
-    baseline_days = max(1, (window_48h_start - baseline_start).days)
+    recent_days = RECENT_WINDOW_HOURS / 24
+    baseline_days = max(1, (window_start - baseline_start).days)
 
     recent_volume_per_day = len(recent_runs) / recent_days
     baseline_volume_per_day = len(baseline_runs) / baseline_days
@@ -129,12 +184,39 @@ def detect_silent_failure(workflow, runs, analysis_end=None):
     recent_success_rate = recent_successes / len(recent_runs) if recent_runs else 0
 
     if volume_ratio < 0.6 and recent_success_rate > 0.95:
+        drop_pct = round((1 - volume_ratio) * 100, 1)
+        estimated_daily_impact = round(reference_volume - recent_volume_per_day, 0)
+
+        confidence = _compute_confidence("silent_failure", {
+            "volume_ratio": volume_ratio,
+            "recent_success_rate": recent_success_rate,
+            "recent_runs_count": len(recent_runs),
+        })
+
+        baseline_label = f"{baseline_start.strftime('%b %d')}-{window_start.strftime('%b %d')}"
+        current_label = f"{window_start.strftime('%b %d')}-{analysis_end.strftime('%b %d')}"
+
+        audit = _build_audit(
+            workflow_id=workflow["workflow_id"],
+            detection_type="silent_failure",
+            baseline_window=baseline_label,
+            current_window=current_label,
+            baseline_rate=round(baseline_volume_per_day, 1),
+            current_rate=round(recent_volume_per_day, 1),
+            delta_pct=round(-drop_pct, 1),
+            total_runs=len(recent_runs),
+            failed_runs=len(recent_runs) - recent_successes,
+            failure_rate=round((1 - recent_success_rate) * 100, 2),
+        )
+
         return [{
             "type": "silent_failure",
+            "confidence": confidence,
             "detail": (
                 f"Volume dropped from ~{reference_volume:.0f}/day to "
                 f"~{recent_volume_per_day:.0f}/day "
-                f"(success rate {recent_success_rate:.0%}). "
+                f"({BASELINE_WINDOW_DAYS}-day baseline vs last {RECENT_WINDOW_HOURS}h, "
+                f"success rate {recent_success_rate:.0%}). "
                 f"Possible trigger break or upstream event suppression."
             ),
             "metrics": {
@@ -142,7 +224,12 @@ def detect_silent_failure(workflow, runs, analysis_end=None):
                 "recent_volume_per_day": round(recent_volume_per_day, 1),
                 "volume_ratio": round(volume_ratio, 3),
                 "recent_success_rate": round(recent_success_rate, 4),
+                "estimated_daily_impact": estimated_daily_impact,
+                "impact_label": "events/day not processed",
+                "baseline_window": baseline_label,
+                "current_window": current_label,
             },
+            "audit": audit,
         }]
 
     return []
@@ -178,30 +265,59 @@ def detect_audit_correlation(workflow, runs, audit_events, window_hours=3):
             first_failure = min(auth_failures, key=lambda r: r["started_at"])
             last_failure = max(auth_failures, key=lambda r: r["started_at"])
 
-            span_minutes = (
-                _parse_ts(last_failure["started_at"]) - _parse_ts(first_failure["started_at"])
+            # Calculate time relative to credential rotation (not first-to-last span)
+            time_to_first_min = (
+                _parse_ts(first_failure["started_at"]) - event_time
             ).total_seconds() / 60
+            time_to_last_min = (
+                _parse_ts(last_failure["started_at"]) - event_time
+            ).total_seconds() / 60
+            failure_span_min = time_to_last_min - time_to_first_min
 
             failed_steps = set(
                 r.get("failed_step_id", "") for r in auth_failures
                 if r.get("failed_step_id")
             )
 
+            confidence = _compute_confidence("audit_correlation", {
+                "auth_failure_count": len(auth_failures),
+                "time_to_first_min": time_to_first_min,
+                "window_hours": window_hours,
+            })
+
+            audit = _build_audit(
+                workflow_id=wf_id,
+                detection_type="audit_correlation",
+                baseline_window="N/A",
+                current_window=f"{event_time.strftime('%b %d %H:%M')}-{window_end.strftime('%H:%M')}",
+                baseline_rate=0,
+                current_rate=0,
+                delta_pct=0,
+                total_runs=len(auth_failures),
+                failed_runs=len(auth_failures),
+                failure_rate=100.0,
+            )
+
             detections.append({
                 "type": "audit_correlation",
+                "confidence": confidence,
                 "detail": (
                     f"{len(auth_failures)} {auth_failures[0]['error_category']} failures "
-                    f"within {span_minutes:.0f}min of credential rotation"
+                    f"between {time_to_first_min:.0f}min and {time_to_last_min:.0f}min "
+                    f"after credential rotation"
                     f"{' at step ' + ', '.join(failed_steps) if failed_steps else ''}."
                 ),
                 "metrics": {
                     "audit_event_type": event["event_type"],
                     "audit_timestamp": event["timestamp"],
                     "auth_failure_count": len(auth_failures),
-                    "failure_window_minutes": round(span_minutes, 1),
+                    "time_to_first_failure_min": round(time_to_first_min, 1),
+                    "time_to_last_failure_min": round(time_to_last_min, 1),
+                    "failure_span_minutes": round(failure_span_min, 1),
                     "error_categories": list(set(r["error_category"] for r in auth_failures)),
                     "failed_steps": list(failed_steps),
                 },
+                "audit": audit,
             })
 
     return detections
@@ -251,7 +367,8 @@ def detect_provider_anomaly(workflows, all_runs, run_steps, external_status):
                 if degraded_start <= _parse_ts(r["started_at"]) <= degraded_end
             ]
 
-            baseline_start = degraded_start - timedelta(days=7)
+            # Baseline: BASELINE_WINDOW_DAYS before degradation
+            baseline_start = degraded_start - timedelta(days=BASELINE_WINDOW_DAYS)
             baseline_runs = [
                 r for r in wf_runs
                 if baseline_start <= _parse_ts(r["started_at"]) < degraded_start
@@ -260,6 +377,7 @@ def detect_provider_anomaly(workflows, all_runs, run_steps, external_status):
             if not during_runs or not baseline_runs:
                 continue
 
+            # Median latency (robust to outliers)
             during_median = median([int(r["duration_ms"]) for r in during_runs])
             baseline_median = median([int(r["duration_ms"]) for r in baseline_runs])
 
@@ -287,8 +405,31 @@ def detect_provider_anomaly(workflows, all_runs, run_steps, external_status):
             wf_names = [w["workflow_name"] for w in affected_workflows]
             total_timeouts = sum(w["timeout_count"] for w in affected_workflows)
 
+            # Primary = worst-affected workflow (highest latency ratio)
+            primary_wf = max(affected_workflows, key=lambda w: w["latency_ratio"])
+
+            confidence = _compute_confidence("provider_anomaly", {
+                "avg_latency_ratio": avg_ratio,
+                "affected_count": len(affected_workflows),
+                "total_timeouts": total_timeouts,
+            })
+
+            audit = _build_audit(
+                workflow_id=primary_wf["workflow_id"],
+                detection_type="provider_anomaly",
+                baseline_window=f"{(degraded_start - timedelta(days=BASELINE_WINDOW_DAYS)).strftime('%b %d')}-{degraded_start.strftime('%b %d')}",
+                current_window=f"{degraded_start.strftime('%b %d %H:%M')}-{degraded_end.strftime('%H:%M')}",
+                baseline_rate=primary_wf["baseline_median_ms"],
+                current_rate=primary_wf["during_median_ms"],
+                delta_pct=round((primary_wf["latency_ratio"] - 1) * 100, 1),
+                total_runs=primary_wf["runs_in_window"],
+                failed_runs=primary_wf["timeout_count"],
+                failure_rate=round(primary_wf["timeout_count"] / max(1, primary_wf["runs_in_window"]) * 100, 1),
+            )
+
             detections.append({
                 "type": "provider_anomaly",
+                "confidence": confidence,
                 "detail": (
                     f"Workflows using {provider} show {avg_ratio:.1f}x latency increase "
                     f"during provider degradation window "
@@ -303,7 +444,10 @@ def detect_provider_anomaly(workflows, all_runs, run_steps, external_status):
                     "affected_workflows": affected_workflows,
                     "avg_latency_ratio": round(avg_ratio, 1),
                     "total_timeouts": total_timeouts,
+                    "primary_workflow_id": primary_wf["workflow_id"],
+                    "primary_workflow_timeouts": primary_wf["timeout_count"],
                 },
+                "audit": audit,
             })
 
     return detections
@@ -346,6 +490,7 @@ def calculate_health_score(workflow, runs, detections, external_status=None):
     deductions = []
 
     # --- 1. Failure rate penalty (up to -50) ---
+    # Failure rate = failed_runs / total_runs (run-level, not step-level)
     if runs:
         timestamps = [_parse_ts(r["started_at"]) for r in runs]
         latest = max(timestamps)
@@ -389,6 +534,7 @@ def calculate_health_score(workflow, runs, detections, external_status=None):
             "points": -35,
             "detail": d["detail"],
             "metrics": d.get("metrics", {}),
+            "confidence": d.get("confidence", ""),
         })
 
     # --- 4. Audit-correlated failure spike (-15) ---
@@ -401,6 +547,7 @@ def calculate_health_score(workflow, runs, detections, external_status=None):
             "points": -15,
             "detail": d["detail"],
             "metrics": d.get("metrics", {}),
+            "confidence": d.get("confidence", ""),
         })
 
     # --- 5. External incident overlap (-15) ---
@@ -413,6 +560,7 @@ def calculate_health_score(workflow, runs, detections, external_status=None):
             "points": -15,
             "detail": d["detail"],
             "metrics": d.get("metrics", {}),
+            "confidence": d.get("confidence", ""),
         })
 
     score = max(0, min(100, score))
@@ -582,22 +730,29 @@ def _format_evidence(deduction):
     if signal == "audit_correlation":
         ts = metrics.get("audit_timestamp", "")
         count = metrics.get("auth_failure_count", 0)
-        window = metrics.get("failure_window_minutes", 0)
-        if ts and count:
+        t_first = metrics.get("time_to_first_failure_min")
+        t_last = metrics.get("time_to_last_failure_min")
+        if ts and count and t_first is not None and t_last is not None:
             ts_short = ts[:16].replace("T", " ")
-            return f"{count} failures within {window:.0f}min of credential change at {ts_short}"
+            return f"{count} failures {t_first:.0f}min-{t_last:.0f}min after credential change at {ts_short}"
+        elif ts and count:
+            ts_short = ts[:16].replace("T", " ")
+            return f"{count} failures after credential change at {ts_short}"
 
     if signal == "external_incident":
         affected = metrics.get("affected_workflows", [])
         provider = metrics.get("provider", "")
         start = metrics.get("degradation_start", "")
         end = metrics.get("degradation_end", "")
+        primary_timeouts = metrics.get("primary_workflow_timeouts")
         total_timeouts = metrics.get("total_timeouts", 0)
         if start and end:
             s = start[11:16]
             e = end[11:16]
             parts = [f"{provider} degradation {s}-{e}"]
-            if total_timeouts:
+            if primary_timeouts is not None:
+                parts.append(f"{primary_timeouts} timeouts (this workflow)")
+            elif total_timeouts:
                 parts.append(f"{total_timeouts} timeouts")
             return " | ".join(parts)
 
@@ -831,11 +986,14 @@ def _compact_observation(insight):
         ref = metrics.get("reference_volume_per_day")
         recent = metrics.get("recent_volume_per_day")
         rate = metrics.get("recent_success_rate")
+        impact = metrics.get("estimated_daily_impact")
         if ref and recent:
             pct = int(round((1 - recent / ref) * 100))
             parts = [f"Volume down {pct}% in 48h ({ref:.0f} \u2192 {recent:.0f}/day)"]
             if rate and rate > 0.95:
                 parts.append("No failures detected")
+            if impact and impact > 0:
+                parts.append(f"~{impact:.0f} events/day not processed")
             return ". ".join(parts) + "."
         return "Significant volume drop with no error signal."
 
@@ -848,7 +1006,8 @@ def _compact_observation(insight):
     if signal == "external_incident":
         ratio = metrics.get("avg_latency_ratio")
         provider = metrics.get("provider", "provider")
-        timeouts = metrics.get("total_timeouts", 0)
+        # Use per-workflow timeouts for the ambient card (not aggregate)
+        timeouts = metrics.get("primary_workflow_timeouts", metrics.get("total_timeouts", 0))
         parts = []
         if ratio:
             parts.append(f"{ratio:.1f}x latency during {provider} degradation")
@@ -930,22 +1089,30 @@ def _detail_metrics(insight):
             ref = metrics.get("reference_volume_per_day")
             recent = metrics.get("recent_volume_per_day")
             rate = metrics.get("recent_success_rate")
+            impact = metrics.get("estimated_daily_impact")
+            bl_window = metrics.get("baseline_window", "7-day")
+            cur_window = metrics.get("current_window", "48h")
             if ref:
-                lines.append(f"Baseline: ~{ref:.0f}/day (7-day avg)")
+                lines.append(f"Baseline: ~{ref:.0f}/day ({bl_window})")
             if recent:
-                lines.append(f"Current: ~{recent:.0f}/day (48h avg)")
+                lines.append(f"Current: ~{recent:.0f}/day ({cur_window})")
             if rate is not None:
                 lines.append(f"Success rate: {rate * 100:.0f}%")
+            if impact and impact > 0:
+                lines.append(f"Estimated impact: ~{impact:.0f} events/day not processed")
 
         elif signal == "audit_correlation":
             ts = metrics.get("audit_timestamp", "")
             count = metrics.get("auth_failure_count", 0)
-            window = metrics.get("failure_window_minutes", 0)
+            t_first = metrics.get("time_to_first_failure_min")
+            t_last = metrics.get("time_to_last_failure_min")
             steps = metrics.get("failed_steps", [])
             if ts:
                 lines.append(f"Credential change: {ts[:16].replace('T', ' ')}")
-            if count:
-                lines.append(f"Auth failures: {count} within {window:.0f}min")
+            if count and t_first is not None and t_last is not None:
+                lines.append(f"Auth failures: {count} ({t_first:.0f}min-{t_last:.0f}min after rotation)")
+            elif count:
+                lines.append(f"Auth failures: {count}")
             if steps:
                 lines.append(f"Affected step: {', '.join(steps)}")
 
@@ -953,12 +1120,18 @@ def _detail_metrics(insight):
             provider = metrics.get("provider", "")
             start = metrics.get("degradation_start", "")
             end = metrics.get("degradation_end", "")
-            timeouts = metrics.get("total_timeouts", 0)
+            # Per-workflow timeouts for this card, total for provider-level
+            primary_timeouts = metrics.get("primary_workflow_timeouts")
+            total_timeouts = metrics.get("total_timeouts", 0)
             affected = metrics.get("affected_workflows", [])
             if provider and start and end:
                 lines.append(f"Provider: {provider} (degraded {start[11:16]}\u2013{end[11:16]})")
-            if timeouts:
-                lines.append(f"Timeout failures: {timeouts}")
+            if primary_timeouts is not None:
+                lines.append(f"Timeout failures: {primary_timeouts} (this workflow)")
+                if total_timeouts and total_timeouts != primary_timeouts:
+                    lines.append(f"Total across affected workflows: {total_timeouts}")
+            elif total_timeouts:
+                lines.append(f"Timeout failures: {total_timeouts}")
             if len(affected) > 1:
                 lines.append(f"Affected workflows: {len(affected)}")
 
@@ -966,7 +1139,7 @@ def _detail_metrics(insight):
             detail = d.get("detail", "")
             match = re.match(r'Failure rate ([\d.]+%) \((\d+/\d+) runs', detail)
             if match:
-                lines.append(f"Failure rate: {match.group(1)} ({match.group(2)} runs)")
+                lines.append(f"Failure rate: {match.group(1)} ({match.group(2)} runs, last 7 days)")
 
     return lines
 
@@ -1023,7 +1196,9 @@ def format_detail_thread(worst_insight, watch_insights=None):
     ):
         signal_label = SIGNAL_CATEGORY.get(d.get("signal", ""), d.get("signal", "unknown"))
         points = d.get("points", 0)
-        lines.append(f"\u2022 {signal_label.title()}: {points}")
+        confidence = d.get("confidence", "")
+        conf_str = f" (Confidence: {confidence})" if confidence else ""
+        lines.append(f"\u2022 {signal_label.title()}: {points}{conf_str}")
 
     detail_lines = _detail_metrics(worst_insight)
     if detail_lines:
