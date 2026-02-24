@@ -800,6 +800,251 @@ def build_suggested_action(detections):
 
 
 # =============================================================================
+# THREE-LAYER FORMATTING (Ambient -> Detail -> LLM)
+# =============================================================================
+
+# Compact action labels for ambient cards
+COMPACT_ACTIONS = {
+    "silent_failure": "Check trigger source",
+    "audit_correlation": "Re-authenticate connection",
+    "external_incident": "Check provider status",
+    "fail_rate": "Review error logs",
+    "latency_spike": "Check performance",
+}
+
+
+def _compact_observation(insight):
+    """Build a single-line observation from the top deduction for ambient cards."""
+    deductions = sorted(
+        insight.get("deductions", []),
+        key=lambda d: abs(d.get("points", 0)),
+        reverse=True,
+    )
+    if not deductions:
+        return "Health score declined"
+
+    top = deductions[0]
+    signal = top.get("signal", "")
+    metrics = top.get("metrics", {})
+
+    if signal == "silent_failure":
+        ref = metrics.get("reference_volume_per_day")
+        recent = metrics.get("recent_volume_per_day")
+        rate = metrics.get("recent_success_rate")
+        if ref and recent:
+            pct = int(round((1 - recent / ref) * 100))
+            parts = [f"Volume down {pct}% in 48h ({ref:.0f} \u2192 {recent:.0f}/day)"]
+            if rate and rate > 0.95:
+                parts.append("No failures detected")
+            return ". ".join(parts) + "."
+        return "Significant volume drop with no error signal."
+
+    if signal == "audit_correlation":
+        count = metrics.get("auth_failure_count", 0)
+        if count:
+            return f"{count} AUTH_EXPIRED failures after credential rotation."
+        return "Auth failures correlated with credential change."
+
+    if signal == "external_incident":
+        ratio = metrics.get("avg_latency_ratio")
+        provider = metrics.get("provider", "provider")
+        timeouts = metrics.get("total_timeouts", 0)
+        parts = []
+        if ratio:
+            parts.append(f"{ratio:.1f}x latency during {provider} degradation")
+        if timeouts:
+            parts.append(f"{timeouts} timeouts")
+        return ". ".join(parts) + "." if parts else "Provider incident detected."
+
+    if signal == "fail_rate":
+        detail = top.get("detail", "")
+        match = re.match(r'Failure rate ([\d.]+%)', detail)
+        if match:
+            return f"Failure rate elevated to {match.group(1)}."
+        return "Elevated failure rate."
+
+    return top.get("detail", "Health score declined").split(".")[0] + "."
+
+
+def _compact_action(insight):
+    """Get a short action string for the ambient card."""
+    deductions = sorted(
+        insight.get("deductions", []),
+        key=lambda d: abs(d.get("points", 0)),
+        reverse=True,
+    )
+    if deductions:
+        signal = deductions[0].get("signal", "")
+        if signal in COMPACT_ACTIONS:
+            return COMPACT_ACTIONS[signal]
+    return "Review workflow"
+
+
+def format_ambient_card(worst_insight, watch_count=0, total_workflows=None):
+    """
+    Format Layer 1: compact ambient card for the single worst workflow.
+    Posted to the Slack channel. 3-4 lines max.
+    """
+    if worst_insight is None:
+        monitored = f"{total_workflows} workflows monitored. " if total_workflows else ""
+        return (
+            f":white_check_mark: *Zapier Insights \u2014 All Workflows Healthy*\n"
+            f"{monitored}No material changes in the last 24 hours."
+        )
+
+    emoji = STATUS_EMOJI.get(worst_insight["status"], ":question:")
+    label = STATUS_LABELS.get(worst_insight["status"], worst_insight["status"])
+    name = worst_insight["workflow_name"]
+    score = worst_insight["health_score"]
+
+    observation = _compact_observation(worst_insight)
+    action = _compact_action(worst_insight)
+
+    lines = [
+        f"{emoji} *{name}* \u2014 {label} ({score})",
+        observation,
+        f"\u2192 {action}",
+    ]
+
+    footer_parts = ["Details in thread"]
+    if watch_count > 0:
+        wf_word = "workflow" if watch_count == 1 else "workflows"
+        footer_parts.append(f"{watch_count} more {wf_word} on Watch")
+    lines.append(f"_{'. '.join(footer_parts)}._")
+
+    return "\n".join(lines)
+
+
+def _detail_metrics(insight):
+    """Extract key metrics from deductions for the detail thread."""
+    lines = []
+    for d in sorted(
+        insight.get("deductions", []),
+        key=lambda dd: abs(dd.get("points", 0)),
+        reverse=True,
+    ):
+        signal = d.get("signal", "")
+        metrics = d.get("metrics", {})
+
+        if signal == "silent_failure":
+            ref = metrics.get("reference_volume_per_day")
+            recent = metrics.get("recent_volume_per_day")
+            rate = metrics.get("recent_success_rate")
+            if ref:
+                lines.append(f"Baseline: ~{ref:.0f}/day (7-day avg)")
+            if recent:
+                lines.append(f"Current: ~{recent:.0f}/day (48h avg)")
+            if rate is not None:
+                lines.append(f"Success rate: {rate * 100:.0f}%")
+
+        elif signal == "audit_correlation":
+            ts = metrics.get("audit_timestamp", "")
+            count = metrics.get("auth_failure_count", 0)
+            window = metrics.get("failure_window_minutes", 0)
+            steps = metrics.get("failed_steps", [])
+            if ts:
+                lines.append(f"Credential change: {ts[:16].replace('T', ' ')}")
+            if count:
+                lines.append(f"Auth failures: {count} within {window:.0f}min")
+            if steps:
+                lines.append(f"Affected step: {', '.join(steps)}")
+
+        elif signal == "external_incident":
+            provider = metrics.get("provider", "")
+            start = metrics.get("degradation_start", "")
+            end = metrics.get("degradation_end", "")
+            timeouts = metrics.get("total_timeouts", 0)
+            affected = metrics.get("affected_workflows", [])
+            if provider and start and end:
+                lines.append(f"Provider: {provider} (degraded {start[11:16]}\u2013{end[11:16]})")
+            if timeouts:
+                lines.append(f"Timeout failures: {timeouts}")
+            if len(affected) > 1:
+                lines.append(f"Affected workflows: {len(affected)}")
+
+        elif signal == "fail_rate":
+            detail = d.get("detail", "")
+            match = re.match(r'Failure rate ([\d.]+%) \((\d+/\d+) runs', detail)
+            if match:
+                lines.append(f"Failure rate: {match.group(1)} ({match.group(2)} runs)")
+
+    return lines
+
+
+def _watch_summary_line(insight):
+    """Build a one-liner summary for a Watch workflow."""
+    top = sorted(
+        insight.get("deductions", []),
+        key=lambda d: abs(d.get("points", 0)),
+        reverse=True,
+    )
+    name = insight["workflow_name"]
+    score = insight["health_score"]
+
+    if not top:
+        return f"\u2022 {name} ({score})"
+
+    d = top[0]
+    signal = d.get("signal", "")
+    metrics = d.get("metrics", {})
+
+    if signal == "audit_correlation":
+        count = metrics.get("auth_failure_count", 0)
+        return f"\u2022 {name} ({score}) \u2014 {count} AUTH_EXPIRED after credential rotation"
+
+    if signal == "external_incident":
+        ratio = metrics.get("avg_latency_ratio")
+        provider = metrics.get("provider", "provider")
+        if ratio:
+            return f"\u2022 {name} ({score}) \u2014 {ratio:.1f}x latency during {provider} degradation"
+
+    if signal == "fail_rate":
+        detail = d.get("detail", "")
+        match = re.match(r'Failure rate ([\d.]+%)', detail)
+        if match:
+            return f"\u2022 {name} ({score}) \u2014 Failure rate {match.group(1)}"
+
+    return f"\u2022 {name} ({score}) \u2014 {SIGNAL_CATEGORY.get(signal, 'issue detected')}"
+
+
+def format_detail_thread(worst_insight, watch_insights=None):
+    """
+    Format Layer 2: deterministic detail for the thread auto-reply.
+    Health score breakdown + metrics for worst workflow, plus Watch summaries.
+    No LLM -- pure rule-based data.
+    """
+    lines = []
+
+    lines.append("*Health Score Breakdown*")
+    for d in sorted(
+        worst_insight.get("deductions", []),
+        key=lambda dd: abs(dd.get("points", 0)),
+        reverse=True,
+    ):
+        signal_label = SIGNAL_CATEGORY.get(d.get("signal", ""), d.get("signal", "unknown"))
+        points = d.get("points", 0)
+        lines.append(f"\u2022 {signal_label.title()}: {points}")
+
+    detail_lines = _detail_metrics(worst_insight)
+    if detail_lines:
+        lines.append("")
+        lines.append("*Metrics*")
+        for dl in detail_lines:
+            lines.append(dl)
+
+    if watch_insights:
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        watch_word = "workflow" if len(watch_insights) == 1 else "workflows"
+        lines.append(f"*Also on Watch ({len(watch_insights)} {watch_word}):*")
+        for wi in watch_insights:
+            lines.append(_watch_summary_line(wi))
+
+    return "\n".join(lines)
+
+
+# =============================================================================
 # PIPELINE
 # =============================================================================
 
@@ -880,13 +1125,28 @@ if data:
         data["external_status"],
     )
 
-    # Format for Slack
+    # Format for Slack (legacy single-message format)
     slack_message = format_all_insights(result, total_workflows=len(data["workflows"]))
+
+    # Format three-layer output
+    insights = result.get("insights", [])
+    total_wf = len(data["workflows"])
+
+    if insights:
+        worst = insights[0]  # Already sorted by score (worst first)
+        watch_list = [i for i in insights[1:] if i["status"] == "watch"]
+        ambient_card = format_ambient_card(worst, watch_count=len(watch_list), total_workflows=total_wf)
+        detail_thread = format_detail_thread(worst, watch_insights=watch_list)
+    else:
+        ambient_card = format_ambient_card(None, total_workflows=total_wf)
+        detail_thread = ""
 
     # Set output for next Zapier step
     output = {
         "insights_count": str(result["insights_count"]),
         "insights_json": json.dumps(result["insights"]),
+        "ambient_card": ambient_card,
+        "detail_thread": detail_thread,
         "slack_message": slack_message,
         "has_insights": "true" if result["insights_count"] > 0 else "false",
     }
